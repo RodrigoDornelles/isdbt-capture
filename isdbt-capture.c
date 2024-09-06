@@ -28,8 +28,11 @@
 #include <poll.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
-
+#define BUFFER_SIZE_UDP 192512
+#define TS_PACKET_SIZE 188
 #define BUFFER_SIZE 4096
 #define MAX_RETRIES 2
 
@@ -340,9 +343,15 @@ int main (int argc, char *argv[])
     char output_file[512];
     char scan_file[512];
     int layer_info = LAYER_FULL;
-    bool scan_mode = false, info_mode = false, player_mode = false, tsoutput_mode = false;
+    bool scan_mode = false, info_mode = false, player_mode = false, tsoutput_mode = false, udp_mode = false;
     char temp_file[64];
     char player_cmd[256];
+    int udp_sock;
+    struct sockaddr_in udp_addr;
+    char udp_buffer[BUFFER_SIZE_UDP];
+    struct timespec udp_interval;
+    long udp_package_size;
+    size_t udp_buffer_len = 0;
     tv_channels = tv_channels_america;
 
     int opt;
@@ -361,7 +370,7 @@ int main (int argc, char *argv[])
     if (argc < 2)
     {
     manual:
-	fprintf(stderr, "Usage modes: \n%s -c channel_number -p player -o output.ts [-l layer_info]\n", argv[0]);
+	fprintf(stderr, "Usage modes: \n%s -c channel_number -p player -o output.ts -u udpserver [-l layer_info]\n", argv[0]);
 	fprintf(stderr, "%s [-s channels.txt]\n", argv[0]);
 	fprintf(stderr, "%s [-i]\n", argv[0]);
 	fprintf(stderr, "\nOptions:\n");
@@ -370,6 +379,7 @@ int main (int argc, char *argv[])
 	fprintf(stderr, " -j            Use Japan channel assignments, instead of American.\n");
 	fprintf(stderr, " -o filename   Output TS filename (Optional).\n");
 	fprintf(stderr, " -p player     Choose a player to play the selected channel (Eg. \"mplayer -vf yadif\" or \"vlc\") (Optional).\n");
+	fprintf(stderr, " -u udpserver  Send TS via UDP, udpserver must be like ip:port:tspackages:bitrate (Optional).\n");
 	fprintf(stderr, " -l [0,1,2,3]  Layer information. Possible values are: 0 (All layers), 1 (Layer A), 2 (Layer B), 3 (Layer C) (Optional).\n\n");
 	fprintf(stderr, " -s channels.cfg   Scan for channels, store them in a file and exit.\n");
         fprintf(stderr, " -i                Print ISDB-T device information and exit.\n");
@@ -378,7 +388,7 @@ int main (int argc, char *argv[])
 	exit(EXIT_FAILURE);
     }
 
-    while ((opt = getopt(argc, argv, "ijha:o:c:l:s:p:")) != -1) 
+    while ((opt = getopt(argc, argv, "ijha:o:c:l:s:p:u:")) != -1) 
     {
         switch (opt)
         {
@@ -415,6 +425,36 @@ int main (int argc, char *argv[])
 	    player_mode = true;
 	    strcpy(player_cmd, optarg);
 	    break;
+    case 'u':
+        udp_mode = true;
+        {
+            char ip[16];
+            long udp_bitrate;
+            memset(&udp_addr, 0, sizeof(udp_addr));
+            if (sscanf(optarg, "%15[^:]:%hi:%li:%li", ip, &(udp_addr.sin_port), &udp_package_size, &udp_bitrate) != 4)
+            {
+                fprintf(stderr, "invalid UDP configuration\n");
+	            exit(EXIT_FAILURE);
+            }
+            if (inet_pton(AF_INET, ip, &(udp_addr.sin_addr.s_addr)) != 1)
+            {
+                fprintf(stderr, "invalid UDP address: %s\n", ip);
+            	exit(EXIT_FAILURE);
+            }
+            if ((BUFFER_SIZE_UDP % udp_package_size) != 0)
+            {
+                fprintf(stderr, "invalid TS packages must be binary base: %li\n", udp_package_size);
+            	exit(EXIT_FAILURE);
+            }
+            memset(&udp_interval, 0, sizeof(udp_interval));
+            udp_package_size *= TS_PACKET_SIZE;
+            udp_bitrate = (long) (1e6 / ((double) (udp_bitrate/8) / udp_package_size)); 
+            udp_interval.tv_sec = udp_bitrate / 1000000;
+            udp_interval.tv_nsec = (udp_bitrate % 1000000) * 1000;
+        }
+        udp_addr.sin_port = htons(udp_addr.sin_port);
+        udp_addr.sin_family = AF_INET;
+        break;
 	default:
 	    goto manual;
 	}
@@ -510,6 +550,14 @@ int main (int argc, char *argv[])
 	}
     }
 
+    if (udp_mode == true)
+    {
+        udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (udp_sock < 0) {
+            fprintf(stderr, "Error opening socket.\n");
+            exit(EXIT_FAILURE);
+        }
+    }
 
     int power = dvbres_getsignalstrength(&res);
     if (power != 0)
@@ -548,6 +596,24 @@ int main (int argc, char *argv[])
 
 	if (player_mode == true)
 	    bytes_written = fwrite(buffer, 1, BUFFER_SIZE, player);
+
+    if (udp_mode == true)
+    {
+        memcpy(&udp_buffer[udp_buffer_len], buffer, BUFFER_SIZE);
+        udp_buffer_len += BUFFER_SIZE;
+        if (udp_buffer_len == BUFFER_SIZE_UDP)
+        {
+            do {
+                if (sendto(udp_sock, &udp_buffer[BUFFER_SIZE_UDP - udp_buffer_len], udp_package_size, 0, (struct sockaddr *) &udp_addr, sizeof(udp_addr)) < 0) {
+                    fprintf(stderr, "failed to send udp package.");
+                    exit(EXIT_FAILURE);
+                }
+                nanosleep(&udp_interval, 0);
+                udp_buffer_len -= udp_package_size;
+            }
+            while(udp_buffer_len != 0);
+        }
+    }
 
 	if (bytes_written != BUFFER_SIZE)
 	    fprintf(stderr, "bytes_written = %d != bytes_read = %d\n", bytes_written, BUFFER_SIZE);
